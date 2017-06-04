@@ -37,19 +37,33 @@
 #include "banding.h"
 #include "banding_version.h"
 #include "xor_rand.h"
+#include "banding_cuda.h"
+#include "plugin_utils.h"
+
+
+#ifdef ENABLE_PERF
+static PerformanceTimer* g_timer = NULL;
+#define TIMER_START g_timer->start()
+#define TIMER_NEXT g_timer->next()
+#define TIMER_END g_timer->end()
+#else
+#define TIMER_START
+#define TIMER_NEXT
+#define TIMER_END
+#endif
 
 //---------------------------------------------------------------------
 //        フィルタ構造体定義
 //---------------------------------------------------------------------
-#define    TRACK_N    8                                                                                    //  トラックバーの数
-TCHAR    *track_name[] =        {"range",  "Y", "Cb", "Cr","ditherY", "ditherC", "sample", "seed" };    //  トラックバーの名前
-int        track_default[] =    {     15,  15,   15,    15,     15,        15,         1,     0   };    //  トラックバーの初期値
-int        track_s[] =            {      0,   0,    0,     0,      0,         0,         0,     0   };    //  トラックバーの下限値
-int        track_e[] =            {     63,  31,   31,    31,     31,        31,         2,   127   };    //  トラックバーの上限値
+#define    TRACK_N    9                                                                                    //  トラックバーの数
+TCHAR    *track_name[] =        {"range",  "Y", "Cb", "Cr","ditherY", "ditherC", "sample", "seed", "CUDA版" };    //  トラックバーの名前
+int        track_default[] =    {     15,  15,   15,    15,     15,        15,         1,     0, 1   };    //  トラックバーの初期値
+int        track_s[] =            {      0,   0,    0,     0,      0,         0,         0,     0, 1   };    //  トラックバーの下限値
+int        track_e[] =            {     63,  31,   31,    31,     31,        31,         2,   127, 5   };    //  トラックバーの上限値
 
-#define    CHECK_N    3                                                                   //  チェックボックスの数
-TCHAR    *check_name[] =     { "ブラー処理を先に","毎フレーム乱数を生成","フィールド処理" }; //  チェックボックスの名前
-int         check_default[] =     { 0, 0, 0 };    //  チェックボックスの初期値 (値は0か1)
+#define    CHECK_N    4                                                                   //  チェックボックスの数
+TCHAR    *check_name[] =     { "ブラー処理を先に","毎フレーム乱数を生成","フィールド処理", "CUDA" }; //  チェックボックスの名前
+int         check_default[] =     { 0, 0, 0, 0 };    //  チェックボックスの初期値 (値は0か1)
 
 FILTER_DLL filter = {
     FILTER_FLAG_EX_INFORMATION,    //    フィルタのフラグ
@@ -104,6 +118,7 @@ EXTERN_C FILTER_DLL __declspec(dllexport) * __stdcall GetFilterTable( void )
 }
 
 BOOL func_init( FILTER *fp ) {
+    init_console();
     ZeroMemory(&band, sizeof(band));
     band.block_count_x = 1;
     band.block_count_y = 1;
@@ -275,15 +290,49 @@ void band_perf_check(FILTER *fp, FILTER_PROC_INFO *fpip) {
 }
 #endif
 
+BandingParam read_setting(FILTER *fp, FILTER_PROC_INFO *fpip)
+{
+    BandingParam prm = {};
+    prm.pitch = fpip->max_w;
+    prm.width = fpip->w;
+    prm.height = fpip->h;
+    prm.seed = fp->track[7];
+    prm.ditherY = fp->track[4];
+    prm.ditherC = fp->track[5];
+    prm.rand_each_frame = fp->check[1];
+    prm.sample_mode = fp->track[6];
+    prm.blur_first = fp->check[0];
+    prm.range = fp->track[0];
+    prm.threshold_y = fp->track[1] << (!(prm.sample_mode && prm.blur_first) + 1);
+    prm.threshold_cb = fp->track[2] << (!(prm.sample_mode && prm.blur_first) + 1);
+    prm.threshold_cr = fp->track[3] << (!(prm.sample_mode && prm.blur_first) + 1);
+    prm.interlaced = fp->check[2];
+    prm.opt = fp->track[8];
+    return prm;
+}
+
 //---------------------------------------------------------------------
 //        フィルタ処理関数
 //---------------------------------------------------------------------
 BOOL func_proc( FILTER *fp, FILTER_PROC_INFO *fpip )
 {
+    if (fp->check[3]) {
+        // CUDA版
+        BandingParam prm = read_setting(fp, fpip);
+        return reduce_banding_cuda(&prm, fpip->ycp_edit, fpip->ycp_edit);
+    }
+
+#ifdef ENABLE_PERF
+    if (g_timer == NULL) {
+        g_timer = new PerformanceTimer();
+    }
+#endif
+
     //初期化確認
     if (NULL == band.gen_rand_avx2) {
         init_band(fp, fpip);
     }
+    TIMER_START;
 
     const int seed = fp->track[7];
     if (seed != band._seed) {
@@ -293,9 +342,11 @@ BOOL func_proc( FILTER *fp, FILTER_PROC_INFO *fpip )
     }
     band.block_count_x = (fpip->w + 127) / 128;
     band.block_count_y = band.current_thread_num;
+    TIMER_NEXT;
     
     //    マルチスレッドでフィルタ処理関数を呼ぶ
     fp->exfunc->exec_multi_thread_func(multi_thread_func, fp, fpip);
+    TIMER_NEXT;
 
 #if BANDING_PERF_CHECK
     band_perf_check(fp, fpip);
@@ -316,6 +367,7 @@ BOOL func_proc( FILTER *fp, FILTER_PROC_INFO *fpip )
             return FALSE;
         init_gen_rand();
     }
+    TIMER_END;
 
     return TRUE;
 }
